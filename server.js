@@ -93,10 +93,13 @@ MANDATORY RULES:
 - "I am excited to discuss"
 - "I would love to learn more"
 - "Our solution can help"
+- "Our software"
+- "Our product"
 - "I am impressed"
 - "It would be a pleasure"
 - "How can we help"
 - "As an AI"
+
 6. Avoid obvious questions.
 7. Avoid exaggerated compliments.
 8. Avoid vague claims.
@@ -254,6 +257,8 @@ JSON SCHEMA:
   }
 });
 
-app.listen(3000, () => {
-  console.log("🚀 CallBrief AI API running on http://localhost:3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 CallBrief AI API running on port ${PORT}`);
 });
