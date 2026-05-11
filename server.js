@@ -8,141 +8,298 @@ dotenv.config();
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-app.get("/", (req, res) => {
-  res.send("🚀 CallBrief AI API Online");
-});
+const PORT = process.env.PORT || 3000;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
-app.post("/briefing", async (req, res) => {
+function cleanText(value) {
+  return String(value || "").trim();
+}
+
+function isMissingRole(role) {
+  const value = cleanText(role).toLowerCase();
+
+  if (!value) return true;
+
+  const invalidRoles = [
+    "cargo não encontrado",
+    "cargo nao encontrado",
+    "não identificado",
+    "nao identificado",
+    "não informado",
+    "nao informado",
+    "not found",
+    "not identified",
+    "role not found",
+    "role not used for crm",
+    "crm card not detected",
+    "company not used"
+  ];
+
+  return invalidRoles.some((item) => value.includes(item));
+}
+
+function hasWeakLeadContext({ name, cargo, empresa, segmento }) {
+  const context = cleanText(segmento);
+  const roleMissing = isMissingRole(cargo);
+  const companyMissing =
+    !empresa ||
+    cleanText(empresa).toLowerCase().includes("company not used") ||
+    cleanText(empresa).toLowerCase().includes("company not found");
+
+  const nameMissing =
+    !name ||
+    cleanText(name).toLowerCase().includes("name not found") ||
+    cleanText(name).toLowerCase().includes("not found");
+
+  if (nameMissing) return true;
+  if (roleMissing && companyMissing) return true;
+  if (context.length < 600) return true;
+
+  return false;
+}
+
+function safeJsonParseFromAI(text) {
+  const raw = cleanText(text);
+
+  if (!raw) {
+    throw new Error("Empty AI response.");
+  }
+
   try {
-    const {
-      name,
-      cargo,
-      empresa,
-      segmento,
-      empresaUsuario,
-      modo
-    } = req.body;
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}") + 1;
 
-    const config = empresaUsuario || {};
-    const briefingMode = modo || "compact";
+    if (start === -1 || end <= 0) {
+      throw new Error("Invalid JSON returned by AI.");
+    }
 
-    const receivedRole =
-      !cargo ||
-      cargo.includes("Cargo não encontrado") ||
-      cargo.includes("Não identificado") ||
-      cargo.includes("Não informado") ||
-      cargo.includes("Not found") ||
-      cargo.includes("Not identified")
-        ? "Role not provided. Infer the most likely role from the page context."
-        : cargo;
+    const jsonString = raw.slice(start, end);
+    return JSON.parse(jsonString);
+  }
+}
 
-    const companyContext = `
+function normalizeQuestions(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => cleanText(item))
+      .filter(Boolean)
+      .slice(0, 3);
+  }
+
+  return [];
+}
+
+function normalizeBriefingPayload(payload, mode) {
+  if (mode === "deep") {
+    return {
+      mode: "deep",
+      inferred_role: cleanText(payload.inferred_role),
+      ice_breaker: cleanText(payload.ice_breaker),
+      profile: cleanText(payload.profile),
+      pain: cleanText(payload.pain),
+      objection: cleanText(payload.objection),
+      strategy: cleanText(payload.strategy),
+      discovery_questions: normalizeQuestions(payload.discovery_questions)
+    };
+  }
+
+  return {
+    mode: "compact",
+    inferred_role: cleanText(payload.inferred_role),
+    opening_hook: cleanText(payload.opening_hook),
+    main_pain: cleanText(payload.main_pain),
+    likely_objection: cleanText(payload.likely_objection),
+    best_approach: cleanText(payload.best_approach),
+    key_question: cleanText(payload.key_question),
+    discovery_questions: normalizeQuestions(payload.discovery_questions)
+  };
+}
+
+function buildCompanyContext(config = {}) {
+  return `
 USER COMPANY USING CALLBRIEF:
 
 Company name:
-${config.nome || "Company not configured"}
+${cleanText(config.nome) || "Company not configured"}
 
 Product/service sold:
-${config.produto || "Product not provided"}
+${cleanText(config.produto) || "Product not provided"}
 
 Industry:
-${config.segmento || "Industry not provided"}
+${cleanText(config.segmento) || "Industry not provided"}
 
 Target audience:
-${config.publicoAlvo || "Target audience not provided"}
+${cleanText(config.publicoAlvo) || "Target audience not provided"}
 
 Pain points solved:
-${config.dores || "Pain points not provided"}
+${cleanText(config.dores) || "Pain points not provided"}
 
 Value proposition:
-${config.propostaValor || "Value proposition not provided"}
+${cleanText(config.propostaValor) || "Value proposition not provided"}
 
 Common objections:
-${config.objecoes || "Common objections not provided"}
+${cleanText(config.objecoes) || "Common objections not provided"}
 
 Sales tone:
-${config.tom || "Consultative, direct and strategic"}
+${cleanText(config.tom) || "Consultative, direct and strategic"}
 `;
+}
 
-    const leadContext = `
+function buildLeadContext({ name, cargo, empresa, segmento }) {
+  const receivedRole = isMissingRole(cargo)
+    ? "Role not provided. Infer the most likely role from context only if there is enough evidence."
+    : cleanText(cargo);
+
+  const companyValue = cleanText(empresa);
+
+  const weakContext = hasWeakLeadContext({
+    name,
+    cargo,
+    empresa,
+    segmento
+  });
+
+  return `
 LEAD BEING ANALYZED:
 
 Name:
-${name || "Name not provided"}
+${cleanText(name) || "Name not provided"}
 
 Received role:
 ${receivedRole}
 
 Company/page:
-${empresa || "Company not provided"}
+${companyValue && companyValue !== "Company not used" ? companyValue : "Company intentionally not used"}
 
-Extracted page context:
-${segmento || "No extracted context"}
+Lead context strength:
+${weakContext ? "WEAK_CONTEXT" : "NORMAL_CONTEXT"}
+
+Extracted page or CRM context:
+${cleanText(segmento) || "No extracted context"}
 `;
+}
 
-    const antiGenericRules = `
+const antiGenericRules = `
 MANDATORY RULES:
 
-1. Do NOT sell CallBrief.
-2. CallBrief is only the tool. The output must help the USER COMPANY sell its own product/service.
-3. Do NOT use generic AI language.
-4. Do NOT write like a corporate robot.
-5. Do NOT use phrases like:
-- "I am excited to discuss"
+1. Do NOT sell CallBrief. CallBrief is only the internal tool.
+2. The output must help the USER COMPANY sell its own product/service.
+3. Do NOT invent precise facts that are not supported by context.
+4. If information is weak, frame it as a hypothesis, not as certainty.
+5. Do NOT overpraise the lead.
+6. Do NOT write emotional compliments.
+7. Do NOT write phrases like:
+- "I was impressed"
+- "I admire"
+- "Congratulations on your determination"
 - "I would love to learn more"
+- "I am excited to discuss"
 - "Our solution can help"
-- "Our software"
 - "Our product"
-- "I am impressed"
-- "It would be a pleasure"
-- "How can we help"
 - "As an AI"
+- "It would be a pleasure"
+8. Do not mention missing company data.
+9. Do not mention that data extraction failed.
+10. If the role is missing, infer a likely role only when context supports it.
+11. If role confidence is low, use a broader label such as:
+- "Business professional"
+- "Operations profile"
+- "Commercial profile"
+- "Financial market professional"
+- "Potential stakeholder"
+12. Every pain must connect to the user company's product/service.
+13. Every discovery question must help advance a real sales conversation.
+14. The briefing must sound like it was prepared by a senior B2B seller.
+15. Keep the language direct, human, consultative and practical.
+16. Avoid saying the lead "is looking for" something unless the context clearly says so.
+17. Avoid saying the lead has a pain unless there is evidence. Prefer "may be worth exploring whether..." when evidence is weak.
+18. Never make the lead sound more senior than the context supports.
+19. If the lead is likely not a decision-maker, focus the strategy on discovery, qualification and mapping the buying process.
+20. Keep the output useful for a sales rep, not pretty for a report.
 
-6. Avoid obvious questions.
-7. Avoid exaggerated compliments.
-8. Avoid vague claims.
-9. Do not invent precise facts that are not supported by context.
-10. If the role is missing or bad, infer the likely role from context.
-11. If the lead appears to be a founder, executive, head or manager, treat them as a strategic decision-maker.
-12. Every pain must be connected to the user company's product/service.
-13. Every question must help advance a real sales conversation.
-14. Every strategy must include clear commercial logic.
-15. The briefing must sound like it was prepared by a senior B2B seller.
+ICE BREAKER RULES:
 
-STYLE:
-- Direct.
-- Human.
-- Consultative.
-- Practical.
-- No fluff.
-- No long generic paragraphs.
-- Use modern B2B sales language.
-- Focus on useful hypotheses, not pretty summaries.
+The ice breaker or opening hook must:
+- reference a concrete context signal;
+- sound natural for a sales conversation;
+- avoid flattery;
+- avoid emotional praise;
+- connect to business context when possible.
+
+Good examples:
+- "I saw your focus on financial markets and client service. How are you currently thinking about improving productivity across commercial routines?"
+- "I noticed your background includes prospecting and client portfolio management. How do you currently organize follow-ups and commercial priorities?"
+- "I saw your recent certification update. Are you currently applying that knowledge more in client acquisition, portfolio management or internal operations?"
+
+Bad examples:
+- "I was impressed by your determination."
+- "Congratulations on your inspiring journey."
+- "Your profile is amazing."
+- "I would love to learn more about your story."
 
 QUALITY BAR:
-The output should help the seller know:
-- why this lead matters;
+
+The seller should understand:
+- why this lead might matter;
 - what likely matters to the lead;
-- what risk or objection may appear;
-- what question to ask first;
-- how to open the conversation naturally.
+- what pain could be explored;
+- what objection may appear;
+- what to ask first;
+- how to open the conversation naturally;
+- whether this is a strong lead or just a discovery opportunity.
 `;
 
-    const promptCompact = `
+const weakContextRules = `
+WEAK CONTEXT RULES:
+
+If Lead context strength is WEAK_CONTEXT:
+1. Be conservative.
+2. Do not assume strong buying intent.
+3. Do not assume the lead is a decision-maker.
+4. Do not create aggressive pain claims.
+5. Use language like:
+- "worth validating"
+- "may be relevant"
+- "could be explored"
+- "possible angle"
+6. The strategy should focus on qualification, not closing.
+7. The discovery questions should uncover:
+- current workflow;
+- decision process;
+- priority level;
+- pain intensity;
+- whether the lead owns or influences the problem.
+8. Avoid HIGH certainty language.
+`;
+
+function buildCompactPrompt(companyContext, leadContext) {
+  return `
 ${companyContext}
 
 ${leadContext}
 
 ${antiGenericRules}
 
+${weakContextRules}
+
 Generate a COMPACT pre-call briefing for a sales rep.
 
 The goal is to give the rep a fast, practical and actionable view before the meeting.
 
-Each field must be short.
-Maximum 1 sentence per field.
+Rules for compact mode:
+- Each field must be short.
+- Maximum 1 sentence per field.
+- Discovery questions must be specific and useful.
+- Avoid generic questions that could apply to anyone.
+- If the lead data is weak, be conservative.
+- Opening hook must not sound like praise.
+- Main pain must be phrased as a hypothesis if not explicit.
+- Best approach must tell the seller what to do in the call.
 
 Return ONLY valid JSON.
 Do not include markdown.
@@ -166,20 +323,29 @@ JSON SCHEMA:
   ]
 }
 `;
+}
 
-    const promptDeep = `
+function buildDeepPrompt(companyContext, leadContext) {
+  return `
 ${companyContext}
 
 ${leadContext}
 
 ${antiGenericRules}
 
+${weakContextRules}
+
 Generate a strategic pre-call briefing for a senior B2B seller.
 
-The briefing must be specific, useful and commercially actionable.
-
-Do not create generic sales advice.
-Create a briefing that feels tailored to this specific lead and to the user company's product/service.
+Rules for deep mode:
+- Be specific, useful and commercially actionable.
+- Do not write long generic paragraphs.
+- Use strong sales reasoning.
+- If the lead data is weak, clearly keep the analysis as a hypothesis.
+- Focus on what the seller should do in the call.
+- Ice breaker must be natural and business-oriented, not complimentary.
+- Pain must be commercially relevant, but not invented.
+- Strategy must include qualification logic when decision authority is unclear.
 
 Return ONLY valid JSON.
 Do not include markdown.
@@ -203,61 +369,231 @@ JSON SCHEMA:
   ]
 }
 `;
+}
+
+async function callGroq(prompt) {
+  if (!GROQ_API_KEY) {
+    throw new Error("Missing GROQ_API_KEY environment variable.");
+  }
+
+  const response = await axios.post(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      model: GROQ_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a senior B2B sales strategist, RevOps expert and consultative discovery coach. You always respond with valid JSON only. You are direct, commercially realistic, and never overhype weak lead data."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0.28,
+      max_tokens: 1200
+    },
+    {
+      timeout: 45000,
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return response.data?.choices?.[0]?.message?.content || "";
+}
+
+app.get("/", (req, res) => {
+  res.send("🚀 CallBrief AI API Online");
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "CallBrief AI API",
+    groqConfigured: Boolean(GROQ_API_KEY),
+    model: GROQ_MODEL,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post("/briefing", async (req, res) => {
+  try {
+    const {
+      name,
+      cargo,
+      empresa,
+      segmento,
+      empresaUsuario,
+      modo
+    } = req.body || {};
+
+    const config = empresaUsuario || {};
+    const briefingMode = modo === "deep" ? "deep" : "compact";
+
+    if (!config.produto) {
+      return res.status(400).json({
+        error: "Missing user company product/service configuration."
+      });
+    }
+
+    const companyContext = buildCompanyContext(config);
+
+    const leadContext = buildLeadContext({
+      name,
+      cargo,
+      empresa,
+      segmento
+    });
 
     const prompt =
       briefingMode === "deep"
-        ? promptDeep
-        : promptCompact;
+        ? buildDeepPrompt(companyContext, leadContext)
+        : buildCompactPrompt(companyContext, leadContext);
 
-    const response = await axios.post(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        model: "llama-3.3-70b-versatile",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a senior B2B sales strategist, RevOps expert and consultative discovery coach. You always respond in valid JSON only."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        temperature: 0.42
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    const text = response.data.choices[0].message.content;
-
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}") + 1;
-
-    if (start === -1 || end === 0) {
-      throw new Error("Invalid JSON returned by AI.");
-    }
-
-    const jsonString = text.slice(start, end);
-    const briefing = JSON.parse(jsonString);
+    const aiText = await callGroq(prompt);
+    const parsed = safeJsonParseFromAI(aiText);
+    const briefing = normalizeBriefingPayload(parsed, briefingMode);
 
     res.json(briefing);
-
   } catch (err) {
-    console.log("AI ERROR:", err.response?.data || err.message);
+    console.error("BRIEFING ERROR:", err.response?.data || err.message);
 
     res.status(500).json({
-      error: "Error generating briefing"
+      error: "Error generating briefing",
+      details:
+        process.env.NODE_ENV === "production"
+          ? undefined
+          : err.response?.data || err.message
     });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+app.post("/followup", async (req, res) => {
+  try {
+    const {
+      notes,
+      empresaUsuario,
+      leadName,
+      leadCompany
+    } = req.body || {};
+
+    const config = empresaUsuario || {};
+    const meetingNotes = cleanText(notes);
+
+    if (!config.produto) {
+      return res.status(400).json({
+        error: "Missing user company product/service configuration."
+      });
+    }
+
+    if (!meetingNotes || meetingNotes.length < 20) {
+      return res.status(400).json({
+        error: "Meeting notes are too short."
+      });
+    }
+
+    const companyContext = buildCompanyContext(config);
+
+    const prompt = `
+${companyContext}
+
+POST-MEETING CONTEXT:
+
+Lead name:
+${cleanText(leadName) || "Lead name not provided"}
+
+Lead company:
+${cleanText(leadCompany) || "Lead company not provided"}
+
+Meeting notes or transcript:
+${meetingNotes}
+
+TASK:
+
+Generate a practical post-meeting follow-up for a B2B seller.
+
+Rules:
+1. Do not sell CallBrief.
+2. Help the user company continue the sales process.
+3. Be specific to the meeting notes.
+4. Do not invent commitments that were not mentioned.
+5. If something is unclear, phrase it carefully.
+6. Use a professional, direct and human tone.
+7. Keep the follow-up email clear and ready to send.
+8. Next steps must be concrete.
+9. Do not use exaggerated praise.
+10. Do not sound like a generic AI assistant.
+
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include comments.
+Do not include explanations outside JSON.
+
+JSON SCHEMA:
+
+{
+  "meeting_summary": "",
+  "key_pain_points": [
+    "",
+    "",
+    ""
+  ],
+  "objections_or_risks": [
+    "",
+    "",
+    ""
+  ],
+  "next_steps": [
+    "",
+    "",
+    ""
+  ],
+  "follow_up_email": {
+    "subject": "",
+    "body": ""
+  },
+  "short_message": "",
+  "crm_note": ""
+}
+`;
+
+    const aiText = await callGroq(prompt);
+    const parsed = safeJsonParseFromAI(aiText);
+
+    res.json({
+      meeting_summary: cleanText(parsed.meeting_summary),
+      key_pain_points: normalizeQuestions(parsed.key_pain_points),
+      objections_or_risks: normalizeQuestions(parsed.objections_or_risks),
+      next_steps: normalizeQuestions(parsed.next_steps),
+      follow_up_email: {
+        subject: cleanText(parsed.follow_up_email?.subject),
+        body: cleanText(parsed.follow_up_email?.body)
+      },
+      short_message: cleanText(parsed.short_message),
+      crm_note: cleanText(parsed.crm_note)
+    });
+  } catch (err) {
+    console.error("FOLLOWUP ERROR:", err.response?.data || err.message);
+
+    res.status(500).json({
+      error: "Error generating follow-up",
+      details:
+        process.env.NODE_ENV === "production"
+          ? undefined
+          : err.response?.data || err.message
+    });
+  }
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Route not found"
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 CallBrief AI API running on port ${PORT}`);
