@@ -1,13 +1,30 @@
 {
   "name": "callbrief-api",
   "version": "1.0.0",
-  "description": "CallBrief AI backend API",
+  "description": "Backend API for CallBrief AI, a sales briefing and follow-up assistant for B2B teams.",
   "type": "module",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
+  "engines": {
+    "node": ">=20 <25"
   },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js"
+  },
+  "keywords": [
+    "sales",
+    "b2b",
+    "ai",
+    "briefing",
+    "crm",
+    "linkedin",
+    "follow-up"
+  ],
+  "author": "CallBrief AI",
+  "license": "UNLICENSED",
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
     "axios": "^1.7.9",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
