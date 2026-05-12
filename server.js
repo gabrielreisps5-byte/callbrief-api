@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -11,8 +12,34 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
+
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!GROQ_API_KEY) {
+  console.warn("⚠️ Missing GROQ_API_KEY");
+}
+
+if (!SUPABASE_URL) {
+  console.warn("⚠️ Missing SUPABASE_URL");
+}
+
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn("⚠️ Missing SUPABASE_SERVICE_ROLE_KEY");
+}
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false
+        }
+      })
+    : null;
 
 function cleanText(value) {
   return String(value || "").trim();
@@ -406,6 +433,158 @@ async function callGroq(prompt) {
   return response.data?.choices?.[0]?.message?.content || "";
 }
 
+function getBearerToken(req) {
+  const authHeader = req.headers.authorization || "";
+  return authHeader.replace("Bearer ", "").trim();
+}
+
+function isTrialExpired(profile) {
+  if (profile.status !== "trialing") return false;
+  if (!profile.trial_ends_at) return false;
+
+  return new Date(profile.trial_ends_at).getTime() < Date.now();
+}
+
+function isPaidOrTrial(profile) {
+  const validStatuses = ["active", "trialing"];
+
+  const paidPlans = [
+    "trial",
+    "founding_monthly",
+    "founding_yearly",
+    "pro_monthly",
+    "pro_yearly",
+    "team"
+  ];
+
+  return validStatuses.includes(profile.status) && paidPlans.includes(profile.plan);
+}
+
+function canUseDeep(profile) {
+  return isPaidOrTrial(profile);
+}
+
+function canUseFollowup(profile) {
+  return isPaidOrTrial(profile);
+}
+
+function sanitizeProfile(profile) {
+  return {
+    email: profile.email,
+    name: profile.name,
+    plan: profile.plan,
+    status: profile.status,
+    briefing_limit: profile.briefing_limit,
+    briefing_used: profile.briefing_used,
+    followup_limit: profile.followup_limit,
+    followup_used: profile.followup_used,
+    trial_ends_at: profile.trial_ends_at,
+    current_period_end: profile.current_period_end
+  };
+}
+
+async function getAuthenticatedProfile(req) {
+  if (!supabase) {
+    const error = new Error("Supabase is not configured.");
+    error.status = 500;
+    throw error;
+  }
+
+  const token = getBearerToken(req);
+
+  if (!token) {
+    const error = new Error("Login required.");
+    error.status = 401;
+    throw error;
+  }
+
+  const { data: userData, error: userError } = await supabase.auth.getUser(token);
+
+  if (userError || !userData?.user) {
+    const error = new Error("Invalid or expired session.");
+    error.status = 401;
+    throw error;
+  }
+
+  const user = userData.user;
+
+  const { data: profile, error: profileError } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("id", user.id)
+    .single();
+
+  if (profileError || !profile) {
+    const error = new Error("User profile not found.");
+    error.status = 403;
+    throw error;
+  }
+
+  if (isTrialExpired(profile)) {
+    await supabase
+      .from("profiles")
+      .update({
+        plan: "free",
+        status: "active",
+        briefing_limit: 5,
+        followup_limit: 0,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", profile.id);
+
+    const error = new Error("Your trial expired. Upgrade to keep using Pro features.");
+    error.status = 403;
+    throw error;
+  }
+
+  return {
+    user,
+    profile
+  };
+}
+
+async function incrementUsage(profile, type) {
+  const updatePayload = {
+    updated_at: new Date().toISOString()
+  };
+
+  if (type === "briefing") {
+    updatePayload.briefing_used = Number(profile.briefing_used || 0) + 1;
+  }
+
+  if (type === "followup") {
+    updatePayload.followup_used = Number(profile.followup_used || 0) + 1;
+  }
+
+  const { error } = await supabase
+    .from("profiles")
+    .update(updatePayload)
+    .eq("id", profile.id);
+
+  if (error) {
+    console.error("USAGE UPDATE ERROR:", error);
+  }
+}
+
+async function logUsage(profile, payload = {}) {
+  if (!supabase || !profile?.id) return;
+
+  const { error } = await supabase
+    .from("usage_logs")
+    .insert({
+      user_id: profile.id,
+      action: payload.action || "unknown",
+      mode: payload.mode || null,
+      source: payload.source || null,
+      lead_name: payload.lead_name || null,
+      lead_role: payload.lead_role || null
+    });
+
+  if (error) {
+    console.error("USAGE LOG ERROR:", error);
+  }
+}
+
 app.get("/", (req, res) => {
   res.send("🚀 CallBrief AI API Online");
 });
@@ -415,13 +594,103 @@ app.get("/health", (req, res) => {
     status: "ok",
     service: "CallBrief AI API",
     groqConfigured: Boolean(GROQ_API_KEY),
+    supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
     model: GROQ_MODEL,
     timestamp: new Date().toISOString()
   });
 });
 
+app.get("/me", async (req, res) => {
+  try {
+    const { profile } = await getAuthenticatedProfile(req);
+
+    res.json({
+      ok: true,
+      profile: sanitizeProfile(profile)
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({
+      ok: false,
+      error: err.message || "Error loading profile."
+    });
+  }
+});
+
+app.post("/start-trial", async (req, res) => {
+  try {
+    const { profile } = await getAuthenticatedProfile(req);
+
+    if (profile.plan !== "free") {
+      return res.status(400).json({
+        ok: false,
+        error: "Trial is only available for Free users."
+      });
+    }
+
+    if (profile.trial_ends_at) {
+      return res.status(400).json({
+        ok: false,
+        error: "Trial already used on this account."
+      });
+    }
+
+    const trialEndsAt = new Date();
+    trialEndsAt.setDate(trialEndsAt.getDate() + 7);
+
+    const { data: updatedProfile, error } = await supabase
+      .from("profiles")
+      .update({
+        plan: "trial",
+        status: "trialing",
+        briefing_limit: 300,
+        briefing_used: 0,
+        followup_limit: 100,
+        followup_used: 0,
+        trial_ends_at: trialEndsAt.toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", profile.id)
+      .select("*")
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    await logUsage(profile, {
+      action: "trial_started"
+    });
+
+    res.json({
+      ok: true,
+      profile: sanitizeProfile(updatedProfile)
+    });
+  } catch (err) {
+    console.error("START TRIAL ERROR:", err.response?.data || err.message);
+
+    res.status(err.status || 500).json({
+      ok: false,
+      error: err.message || "Error starting trial."
+    });
+  }
+});
+
 app.post("/briefing", async (req, res) => {
   try {
+    const { profile } = await getAuthenticatedProfile(req);
+
+    if (profile.status !== "active" && profile.status !== "trialing") {
+      return res.status(403).json({
+        error: "Subscription inactive."
+      });
+    }
+
+    if (Number(profile.briefing_used || 0) >= Number(profile.briefing_limit || 0)) {
+      return res.status(403).json({
+        error: "Monthly briefing limit reached. Upgrade your plan to keep generating briefings."
+      });
+    }
+
     const {
       name,
       cargo,
@@ -437,6 +706,12 @@ app.post("/briefing", async (req, res) => {
     if (!config.produto) {
       return res.status(400).json({
         error: "Missing user company product/service configuration."
+      });
+    }
+
+    if (briefingMode === "deep" && !canUseDeep(profile)) {
+      return res.status(403).json({
+        error: "Deep Mode is available on Pro. Start your 7-day trial to unlock it."
       });
     }
 
@@ -458,12 +733,22 @@ app.post("/briefing", async (req, res) => {
     const parsed = safeJsonParseFromAI(aiText);
     const briefing = normalizeBriefingPayload(parsed, briefingMode);
 
+    await incrementUsage(profile, "briefing");
+
+    await logUsage(profile, {
+      action: "briefing",
+      mode: briefingMode,
+      source: req.body?.source || null,
+      lead_name: name || null,
+      lead_role: cargo || null
+    });
+
     res.json(briefing);
   } catch (err) {
     console.error("BRIEFING ERROR:", err.response?.data || err.message);
 
-    res.status(500).json({
-      error: "Error generating briefing",
+    res.status(err.status || 500).json({
+      error: err.message || "Error generating briefing",
       details:
         process.env.NODE_ENV === "production"
           ? undefined
@@ -474,6 +759,20 @@ app.post("/briefing", async (req, res) => {
 
 app.post("/followup", async (req, res) => {
   try {
+    const { profile } = await getAuthenticatedProfile(req);
+
+    if (!canUseFollowup(profile)) {
+      return res.status(403).json({
+        error: "Follow-up is available on Pro. Start your 7-day trial to unlock it."
+      });
+    }
+
+    if (Number(profile.followup_used || 0) >= Number(profile.followup_limit || 0)) {
+      return res.status(403).json({
+        error: "Monthly follow-up limit reached."
+      });
+    }
+
     const {
       notes,
       empresaUsuario,
@@ -564,7 +863,7 @@ JSON SCHEMA:
     const aiText = await callGroq(prompt);
     const parsed = safeJsonParseFromAI(aiText);
 
-    res.json({
+    const followup = {
       meeting_summary: cleanText(parsed.meeting_summary),
       key_pain_points: normalizeQuestions(parsed.key_pain_points),
       objections_or_risks: normalizeQuestions(parsed.objections_or_risks),
@@ -575,12 +874,22 @@ JSON SCHEMA:
       },
       short_message: cleanText(parsed.short_message),
       crm_note: cleanText(parsed.crm_note)
+    };
+
+    await incrementUsage(profile, "followup");
+
+    await logUsage(profile, {
+      action: "followup",
+      lead_name: leadName || null,
+      lead_role: null
     });
+
+    res.json(followup);
   } catch (err) {
     console.error("FOLLOWUP ERROR:", err.response?.data || err.message);
 
-    res.status(500).json({
-      error: "Error generating follow-up",
+    res.status(err.status || 500).json({
+      error: err.message || "Error generating follow-up",
       details:
         process.env.NODE_ENV === "production"
           ? undefined
