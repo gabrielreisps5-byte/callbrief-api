@@ -3,12 +3,20 @@ import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import Stripe from "stripe";
 
 dotenv.config();
 
 const app = express();
 
 app.use(cors());
+
+app.post(
+  "/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook
+);
+
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -18,6 +26,19 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+const STRIPE_FOUNDING_MONTHLY_PRICE_ID =
+  process.env.STRIPE_FOUNDING_MONTHLY_PRICE_ID;
+
+const STRIPE_FOUNDING_ANNUAL_PRICE_ID =
+  process.env.STRIPE_FOUNDING_ANNUAL_PRICE_ID;
+
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY)
+  : null;
 
 if (!GROQ_API_KEY) {
   console.warn("⚠️ Missing GROQ_API_KEY");
@@ -29,6 +50,22 @@ if (!SUPABASE_URL) {
 
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("⚠️ Missing SUPABASE_SERVICE_ROLE_KEY");
+}
+
+if (!STRIPE_SECRET_KEY) {
+  console.warn("⚠️ Missing STRIPE_SECRET_KEY");
+}
+
+if (!STRIPE_WEBHOOK_SECRET) {
+  console.warn("⚠️ Missing STRIPE_WEBHOOK_SECRET");
+}
+
+if (!STRIPE_FOUNDING_MONTHLY_PRICE_ID) {
+  console.warn("⚠️ Missing STRIPE_FOUNDING_MONTHLY_PRICE_ID");
+}
+
+if (!STRIPE_FOUNDING_ANNUAL_PRICE_ID) {
+  console.warn("⚠️ Missing STRIPE_FOUNDING_ANNUAL_PRICE_ID");
 }
 
 const supabase =
@@ -149,7 +186,7 @@ function normalizeBriefingPayload(payload, mode) {
 
 function buildCompanyContext(config = {}) {
   return `
-USER COMPANY USING CALLBRIEF:
+USER COMPANY USING OCTIQ:
 
 Company name:
 ${cleanText(config.nome) || "Company not configured"}
@@ -214,7 +251,7 @@ ${cleanText(segmento) || "No extracted context"}
 const antiGenericRules = `
 MANDATORY RULES:
 
-1. Do NOT sell CallBrief. CallBrief is only the internal tool.
+1. Do NOT sell OctIQ. OctIQ is only the internal tool.
 2. The output must help the USER COMPANY sell its own product/service.
 3. Do NOT invent precise facts that are not supported by context.
 4. If information is weak, frame it as a hypothesis, not as certainty.
@@ -585,16 +622,191 @@ async function logUsage(profile, payload = {}) {
   }
 }
 
+async function logStripeEventWithoutProfile(payload = {}) {
+  console.warn("STRIPE EVENT WITHOUT PROFILE:", payload);
+}
+
+async function activateFoundingPlanByEmail({
+  email,
+  plan,
+  stripeCustomerId,
+  stripeSubscriptionId
+}) {
+  if (!supabase) {
+    throw new Error("Supabase is not configured.");
+  }
+
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  if (!normalizedEmail) {
+    throw new Error("Missing customer email.");
+  }
+
+  const isAnnual = plan === "founding_yearly";
+
+  const updatePayload = {
+    plan,
+    status: "active",
+    briefing_limit: isAnnual ? 3600 : 300,
+    briefing_used: 0,
+    followup_limit: isAnnual ? 1200 : 100,
+    followup_used: 0,
+    trial_ends_at: null,
+    current_period_end: isAnnual
+      ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
+      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    stripe_customer_id: stripeCustomerId || null,
+    stripe_subscription_id: stripeSubscriptionId || null,
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .update(updatePayload)
+    .eq("email", normalizedEmail)
+    .select("id,email,plan,status")
+    .single();
+
+  if (error || !data) {
+    console.error("STRIPE PROFILE UPDATE ERROR:", error);
+
+    await logStripeEventWithoutProfile({
+      email: normalizedEmail,
+      plan,
+      stripeCustomerId,
+      stripeSubscriptionId
+    });
+
+    throw new Error(
+      `Payment received, but no OctIQ profile found for email: ${normalizedEmail}`
+    );
+  }
+
+  const { error: logError } = await supabase
+    .from("usage_logs")
+    .insert({
+      user_id: data.id,
+      action: "stripe_payment_activated",
+      mode: plan,
+      source: "stripe",
+      lead_name: normalizedEmail,
+      lead_role: stripeSubscriptionId || null
+    });
+
+  if (logError) {
+    console.error("STRIPE USAGE LOG ERROR:", logError);
+  }
+
+  return data;
+}
+
+async function getPriceIdFromCheckoutSession(session) {
+  if (!stripe) {
+    throw new Error("Stripe is not configured.");
+  }
+
+  const lineItems = await stripe.checkout.sessions.listLineItems(session.id, {
+    limit: 5
+  });
+
+  return lineItems?.data?.[0]?.price?.id || "";
+}
+
+async function handleStripeWebhook(req, res) {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    return res.status(500).send("Stripe webhook is not configured.");
+  }
+
+  const signature = req.headers["stripe-signature"];
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("STRIPE WEBHOOK SIGNATURE ERROR:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      const customerEmail =
+        session.customer_details?.email ||
+        session.customer_email ||
+        "";
+
+      const priceId = await getPriceIdFromCheckoutSession(session);
+
+      let plan = "";
+
+      if (priceId === STRIPE_FOUNDING_MONTHLY_PRICE_ID) {
+        plan = "founding_monthly";
+      }
+
+      if (priceId === STRIPE_FOUNDING_ANNUAL_PRICE_ID) {
+        plan = "founding_yearly";
+      }
+
+      if (!plan) {
+        console.warn("STRIPE WEBHOOK UNKNOWN PRICE:", {
+          priceId,
+          sessionId: session.id
+        });
+
+        return res.json({
+          received: true,
+          ignored: true,
+          reason: "unknown_price"
+        });
+      }
+
+      await activateFoundingPlanByEmail({
+        email: customerEmail,
+        plan,
+        stripeCustomerId:
+          typeof session.customer === "string" ? session.customer : null,
+        stripeSubscriptionId:
+          typeof session.subscription === "string"
+            ? session.subscription
+            : null
+      });
+
+      console.log("✅ Stripe payment activated:", {
+        email: customerEmail,
+        plan,
+        priceId
+      });
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("STRIPE WEBHOOK HANDLER ERROR:", err.message);
+
+    return res.status(500).json({
+      received: true,
+      error: err.message
+    });
+  }
+}
+
 app.get("/", (req, res) => {
-  res.send("🚀 CallBrief AI API Online");
+  res.send("🚀 OctIQ API Online");
 });
 
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    service: "CallBrief AI API",
+    service: "OctIQ API",
     groqConfigured: Boolean(GROQ_API_KEY),
     supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+    stripeConfigured: Boolean(STRIPE_SECRET_KEY),
+    stripeWebhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
     model: GROQ_MODEL,
     timestamp: new Date().toISOString()
   });
@@ -816,7 +1028,7 @@ TASK:
 Generate a practical post-meeting follow-up for a B2B seller.
 
 Rules:
-1. Do not sell CallBrief.
+1. Do not sell OctIQ.
 2. Help the user company continue the sales process.
 3. Be specific to the meeting notes.
 4. Do not invent commitments that were not mentioned.
@@ -905,5 +1117,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 CallBrief AI API running on port ${PORT}`);
+  console.log(`🚀 OctIQ API running on port ${PORT}`);
 });
